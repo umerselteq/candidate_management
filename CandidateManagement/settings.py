@@ -102,6 +102,25 @@ CACHES = {
     }
 }
 
+# REST_FRAMEWORK = {
+#     'DEFAULT_THROTTLE_CLASSES': [
+#         'rest_framework.throttling.AnonRateThrottle',  # For anonymous users
+#         'rest_framework.throttling.UserRateThrottle',  # For authenticated users
+#     ],
+#     'DEFAULT_THROTTLE_RATES': {
+#         'anon': '5/minute',
+#         'user': '2/minute',
+#     }
+# }
+
+REST_FRAMEWORK = {
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '5/minute',
+        'user': '2/minute',
+        'custom': '10/minute'
+    }
+}
+
 
 # Password validation
 # https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators
