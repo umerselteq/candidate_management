@@ -6,9 +6,11 @@ from .serializers import CandidateSerializer, CandidateStatusSerializer
 from django.http import Http404
 from django.core.cache import cache
 from django.http import JsonResponse
-from candidate.throttling import CustomRateThrottle
 from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
-
+from .rabbitmq_producer import send_massage
+from .rabbitmq_consumer import receive_message
+import logging
+logger = logging.getLogger('logger')
 
 
 class login(APIView):
@@ -28,34 +30,37 @@ class login(APIView):
             return Response({'error': str(e)})
 
 
-def cache_view(request):
-    data = cache.get('my_key')
-    if not data:
-        data = 'some expensive computation'
-        cache.set('my_key', data, timeout=60*15)
-    return JsonResponse(data, safe=False)
+def rabbit_view(request):
+    send_massage("this is a message")
+    return JsonResponse({'message': 'this is a message'})
+    # data = cache.get('my_key')
+    # if not data:
+    #     data = 'some expensive computation'
+    #     cache.set('my_key', data, timeout=60*15)
+    # return JsonResponse(data, safe=False)
 
 
 def candidate_cache_set():
     try:
-        print("candidate cache called")
+        print("candidate rabbit called")
+        logger.info('Data is sent to RabbitMQ queue')
         data = Candidate.objects.all()
         serializer = CandidateSerializer(data, many=True)
         serialized_data = serializer.data
-        cache.set('candidates', serialized_data, timeout=60*15)
+        send_massage(serialized_data)
         return serialized_data
     except Exception as e:
         print(e)
+        # cache.set('candidates', serialized_data, timeout=60*15)
 
 
 class CandidateSetByParent(APIView):
-    throttle_classes = [AnonRateThrottle]
 
     def get(self, request):
         parent_id = request.GET.get('parent_id')
         parent_id = int(parent_id)
         try:
-            data = cache.get('candidates')
+            data = receive_message()
             if data is None:
                 data = candidate_cache_set()
             candidates = data
@@ -81,11 +86,12 @@ class CandidateSetByParent(APIView):
                 if serializer.is_valid():
                     serializer.save()
                     responses.append(serializer.data)
-                    candidate_cache_set()
                 else:
                     errors.append(serializer.errors)
             except Exception as e:
                 errors.append({'error': str(e)})
+        candidate_cache_set()
+        logger.info('Candidates registered by parent')
         if errors:
             return Response({'success': responses, 'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
         return Response({'success': responses}, status=status.HTTP_201_CREATED)
@@ -96,6 +102,7 @@ class CandidateSetByParent(APIView):
             candidates = Candidate.objects.filter(parentId=parent_id)
             candidates.delete()
             candidate_cache_set()
+            logger.info(f'Candidates are deleted by parent id: {parent_id}')
             return Response({'success'}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
@@ -119,7 +126,7 @@ class CandidateViewSet_By_Id(APIView):
 
         if user_id is None:
             try:
-                data = cache.get('candidates')
+                data = receive_message()
                 if not data:
                     data = candidate_cache_set()
                 return JsonResponse(data, safe=False)
@@ -135,7 +142,7 @@ class CandidateViewSet_By_Id(APIView):
                 return Response({'not a authenticated user'}, status=status.HTTP_401_UNAUTHORIZED)
             print(user_id)
             try:
-                data = cache.get('candidates')
+                data = receive_message()
                 if not data:
                     data = candidate_cache_set()
                 candidates = data
@@ -154,7 +161,8 @@ class CandidateViewSet_By_Id(APIView):
         try:
             c = self.get_object(user_id)
             c.delete()
-            candidate_cache_set()  # update the cache
+            candidate_cache_set()  # now updating the rabbitmq
+            logger.info(f'Candidate deleted id: {user_id}')
             return Response({'success': True})
         except Http404:
             return Response({'error': 'Candidate not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -168,7 +176,8 @@ class CandidateViewSet_By_Id(APIView):
             serializer = CandidateSerializer(c, data=request.data, partial=True)
             if serializer.is_valid():
                 serializer.save()
-                candidate_cache_set()  # update the cache
+                candidate_cache_set()  # updating the rabbitmq
+                logger.info(f'Candidate updated id: {user_id}')
                 return Response(serializer.data, status=status.HTTP_200_OK)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         except Http404:
@@ -180,22 +189,24 @@ class CandidateViewSet_By_Id(APIView):
 class CandidateStatusViewSet(APIView):
     def get(self, request):
         try:
-            data = cache.get('candidates')
+            data = receive_message()
             if not data:
                 data = candidate_cache_set()
             candidates = data
             persons = [(candidate['id'], candidate['firstName'], candidate['status']) for candidate in candidates]
-            # persons.append((candidate['id'], candidate['firstName'], candidate['status']))
             return JsonResponse(persons, safe=False)
         except Exception as e:
+            logger.warning({'error': str(e)})
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 
     def post(self, request):
         try:
             serializer = CandidateStatusSerializer(data=request.data)
             if serializer.is_valid():
                 serializer.save()
-                candidate_cache_set()
+                candidate_cache_set()  # updating rabbitmq
+                logger.info('Candidate status posted successfully')
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=400)
         except Exception as e:
@@ -214,7 +225,8 @@ class CandidateStatusViewSet(APIView):
             serializer = CandidateStatusSerializer(c, data=request.data, partial=True)
             if serializer.is_valid():
                 serializer.save()
-                candidate_cache_set()
+                candidate_cache_set()  # updating rabbitmq
+                logger.info(f'Candidate status updated id: {candidate_id} to: {request.data}')
                 return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -231,6 +243,7 @@ def setting_parent_id(request):
         if length > 1:
             if parent_id is None:
                 print({'error': 'multiple candidates provided but no parent id'})
+                logger.warning('multiple candidates provided but no parent id')
                 return None
             for candidate in candidates:
                 candidate['parentId'] = parent_id
